@@ -18,6 +18,10 @@ const STOP_RESEND_MS: u64 = 5 * 1000;
 /// The most a resend is delayed past `STOP_RESEND_MS`, drawn per resend, so the actors of one
 /// envoy that were stopped together do not resend and read its record in lockstep.
 const STOP_RESEND_JITTER_MS: u64 = 2 * 1000;
+/// How long a due alarm that found no envoy to start its actor on waits before it tries again.
+/// Envoys reconnect about a second after the engine starts, so a short wait keeps the alarm
+/// close to its deadline.
+const ALARM_NO_ENVOY_RETRY_MS: u64 = 1000;
 
 pub struct ActorStateMachine;
 
@@ -493,9 +497,12 @@ impl DurableStateMachine for ActorStateMachine {
 				RuntimeEvent::Input(wire::ActorEvent::Create(event)) => {
 					try_start(state, effects, event.waiter, preparation, now_unix_ms);
 				}
-				RuntimeEvent::Timer(wire::ActorTimer::AlarmTimeout) => {
-					wake(state, effects, preparation, now_unix_ms);
-				}
+				// With no envoy to start on, as right after the engine starts and before its
+				// envoys reconnect, the alarm is armed again so the wake is not lost.
+				RuntimeEvent::Timer(wire::ActorTimer::AlarmTimeout) => match preparation {
+					Some(_) => wake(state, effects, preparation, now_unix_ms),
+					None => rearm_alarm(effects, entropy),
+				},
 				RuntimeEvent::Input(wire::ActorEvent::Reallocate(event)) => {
 					if event.epoch == state.epoch {
 						allocate_actor(state, effects, preparation, Dispatch::Durable, now_unix_ms);
@@ -1069,6 +1076,17 @@ fn set_pending_action(
 	}
 }
 
+/// Arms the alarm again for a wake that found no envoy to start the actor on. The jitter keeps
+/// the actors whose alarms came due together, as when the engine starts, from retrying in
+/// lockstep.
+fn rearm_alarm(effects: &mut Effects<Effect, wire::ActorTimer, WriteEffect>, entropy: Entropy) {
+	let jitter_ms = entropy.rng().gen_range(0..STOP_RESEND_JITTER_MS);
+	effects.arm_timer_after(
+		wire::ActorTimer::AlarmTimeout,
+		ALARM_NO_ENVOY_RETRY_MS + jitter_ms,
+	);
+}
+
 /// Ends the current epoch: its timers are cancelled, the epoch moves on, and the pending action
 /// decides whether the actor sleeps, starts again or is destroyed. `hint` is the envoy a
 /// command pre-selected for a start this stop leads to.
@@ -1470,4 +1488,137 @@ pub struct State(pub wire::ActorState);
 
 impl rivet_state_machine::StateMachineState for State {}
 
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use rivet_state_machine::RuntimeEffect;
 
+	fn sleeping_actor() -> State {
+		State(wire::ActorState {
+			phase: wire::ActorPhase::Sleeping,
+			epoch: 1,
+			create_unix_ms: 10,
+			command_index: 2,
+			index_bucket_count: 1,
+			pending_action: wire::PendingAction::PendingNone,
+			write_index: wire::WriteIndexEffectData {
+				namespace: "default".into(),
+				name: "test".into(),
+				create_unix_ms: 10,
+				state: wire::WriteIndexState {
+					phase: wire::WriteIndexPhase::WriteIndexPhaseSuccess,
+					attempt: 1,
+					create_unix_ms: 10,
+				},
+			},
+			start_waiters: Vec::new(),
+			start_waiters_capacity: 1,
+		})
+	}
+
+	fn allocation() -> wire::ActorAllocation {
+		wire::ActorAllocation {
+			envoy_key: "envoy".into(),
+			worker_id: vec![1; 16].into(),
+			connection_id: vec![2; 16].into(),
+		}
+	}
+
+	fn fire_alarm(
+		state: &mut State,
+		now: Clocks,
+		preparation: Option<wire::ActorAllocation>,
+	) -> Effects<Effect, wire::ActorTimer, WriteEffect> {
+		let event = rivet_state_machine::Event {
+			now,
+			entropy: Entropy([0; 32]),
+			body: RuntimeEvent::Timer(wire::ActorTimer::AlarmTimeout),
+		};
+		assert!(needs_allocation(&state.0, &event.body));
+		let mut effects = Effects::new(now);
+		ActorStateMachine::on_event(state, event, preparation, &mut effects);
+		effects
+	}
+
+	fn assert_started(
+		state: &State,
+		before: &State,
+		effects: &Effects<Effect, wire::ActorTimer, WriteEffect>,
+		allocation: &wire::ActorAllocation,
+		now: Clocks,
+	) {
+		let mut expected = before.clone();
+		expected.0.command_index += 1;
+		expected.0.phase = wire::ActorPhase::Starting(wire::Starting {
+			allocation: allocation.clone(),
+		});
+		assert_eq!(state, &expected);
+		assert_eq!(
+			effects.as_slice(),
+			&[
+				RuntimeEffect::Execute(Effect::Start {
+					epoch: before.0.epoch,
+					command_index: before.0.command_index + 1,
+					allocation: allocation.clone(),
+					new_storage: false,
+				}),
+				RuntimeEffect::ArmTimer {
+					timer: wire::ActorTimer::StartTimeout(wire::StartTimeout {
+						epoch: before.0.epoch,
+					}),
+					at_boot_ms: now.boot_ms + 15_000,
+				},
+			]
+		);
+		assert!(effects.nondurable().is_empty());
+		assert!(effects.writes().is_empty());
+	}
+
+	#[test]
+	fn sleeping_alarm_retries_without_allocation_then_starts() {
+		let mut state = sleeping_actor();
+		let before = state.clone();
+		let mut now = Clocks {
+			boot_ms: 100,
+			unix_ms: 10_000,
+		};
+
+		for _ in 0..3 {
+			let effects = fire_alarm(&mut state, now, None);
+			assert_eq!(state, before);
+			let [
+				RuntimeEffect::ArmTimer {
+					timer: wire::ActorTimer::AlarmTimeout,
+					at_boot_ms,
+				},
+			] = effects.as_slice()
+			else {
+				panic!("an unavailable allocation must only rearm the alarm");
+			};
+			assert!((now.boot_ms + 1_000..now.boot_ms + 3_000).contains(at_boot_ms));
+			assert!(effects.nondurable().is_empty());
+			assert!(effects.writes().is_empty());
+
+			now.unix_ms += (*at_boot_ms - now.boot_ms) as i64;
+			now.boot_ms = *at_boot_ms;
+		}
+
+		let allocation = allocation();
+		let effects = fire_alarm(&mut state, now, Some(allocation.clone()));
+		assert_started(&state, &before, &effects, &allocation, now);
+	}
+
+	#[test]
+	fn sleeping_alarm_with_allocation_starts_without_retry() {
+		let mut state = sleeping_actor();
+		let before = state.clone();
+		let now = Clocks {
+			boot_ms: 100,
+			unix_ms: 10_000,
+		};
+		let allocation = allocation();
+
+		let effects = fire_alarm(&mut state, now, Some(allocation.clone()));
+		assert_started(&state, &before, &effects, &allocation, now);
+	}
+}
